@@ -35,7 +35,7 @@
     .sub{color:var(--muted);font-size:12px;letter-spacing:.12em;text-transform:uppercase;font-weight:800}
     .brand{display:flex;flex-direction:column;gap:8px}
 
-    .clock-wrap{display:flex;flex-direction:column;align-items:flex-end;gap:6px;min-width:260px}
+    .clock-wrap{display:flex;flex-direction:column;align-items:flex-end;gap:6px;min-width:320px}
     .dt{
       display:flex; flex-direction:column; align-items:flex-end; gap:6px;
       padding:10px 12px; border-radius:14px;
@@ -49,7 +49,6 @@
       letter-spacing:.14em;
       text-transform:uppercase;
       color:rgba(255,255,255,.75);
-      font-family:var(--font);
       text-align:right;
     }
     #clock{
@@ -155,7 +154,9 @@
         <div id="date">—</div>
         <div id="clock">00:00:00</div>
       </div>
-      <div class="cutoff">Check-in: <b>10:05</b> • Check-out: <b>16:10</b></div>
+      <div class="cutoff">
+        Check-in: <b>09:50 → 10:05</b> • Check-out: <b>15:55 → 16:10</b>
+      </div>
     </div>
   </header>
 
@@ -204,10 +205,14 @@
   const auth = getAuth(app);
   const db = getFirestore(app);
 
+  // Kiosk: one device can do check in/out for anyone by code
   const TEAM = { "2021":"Aysha", "2022":"Areeba", "2023":"Afra", "2024":"Sekandar", "2025":"Salem" };
 
-  const CHECKIN_CUTOFF_MIN  = 10 * 60 + 5;   // 10:05
-  const CHECKOUT_CUTOFF_MIN = 16 * 60 + 10;  // 16:10
+  // Windows (Dubai minutes)
+  const CHECKIN_OPEN_MIN   = 9 * 60 + 50;  // 09:50
+  const CHECKIN_CLOSE_MIN  = 10 * 60 + 5;  // 10:05
+  const CHECKOUT_OPEN_MIN  = 15 * 60 + 55; // 15:55
+  const CHECKOUT_CLOSE_MIN = 16 * 60 + 10; // 16:10
 
   const input = document.getElementById("code");
   const inBtn = document.getElementById("in");
@@ -219,37 +224,35 @@
   const statusDot = document.getElementById("statusDot");
 
   let busy = false;
-  let todayMap = {};      // { name: {checkInTime, checkOutTime, ...} }
+  let todayMap = {};
   let activeDateId = null;
   let unsub = null;
 
-  function dubaiParts(date = new Date()){
-    const fmt = new Intl.DateTimeFormat("en-GB", {
-      timeZone: "Asia/Dubai",
-      hour: "2-digit", minute: "2-digit", second: "2-digit",
-      hourCycle: "h23",
-      year: "numeric", month: "2-digit", day: "2-digit",
-      weekday: "short"
-    });
-    const parts = fmt.formatToParts(date);
-    const get = (t) => parts.find(p => p.type === t)?.value;
-    const hh = Number(get("hour")), mm = Number(get("minute"));
-    const dateId = `${get("year")}-${get("month")}-${get("day")}`;
-    const time = `${get("hour")}:${get("minute")}:${get("second")}`;
-    const minutes = hh * 60 + mm;
-
-    // Nice readable date like: Thu, 05 Mar 2026
-    const niceDate = `${get("weekday")}, ${get("day")} ${get("month")} ${get("year")}`
-      // month is numeric in en-GB parts, so let's format separately below:
-      ;
-
-    // better: use another formatter for pretty date
+  function dubaiNow(date = new Date()){
     const pretty = new Intl.DateTimeFormat("en-GB", {
       timeZone: "Asia/Dubai",
       weekday: "short", day: "2-digit", month: "short", year: "numeric"
     }).format(date);
 
-    return { dateId, time, minutes, prettyDate: pretty };
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Asia/Dubai",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hourCycle: "h23",
+      year: "numeric", month: "2-digit", day: "2-digit"
+    }).formatToParts(date);
+
+    const get = (t) => parts.find(p => p.type === t)?.value;
+    const hh = Number(get("hour")), mm = Number(get("minute"));
+    return {
+      dateId: `${get("year")}-${get("month")}-${get("day")}`,
+      time: `${get("hour")}:${get("minute")}:${get("second")}`,
+      minutes: hh * 60 + mm,
+      prettyDate: pretty
+    };
+  }
+
+  function inWindow(openMin, closeMin, nowMin){
+    return nowMin >= openMin && nowMin <= closeMin;
   }
 
   function sanitizeCode(v){ return (v || "").replace(/\D/g,"").slice(0,4); }
@@ -282,12 +285,13 @@
   }
 
   function listenForToday(){
-    const s = dubaiParts();
+    const s = dubaiNow();
     if (s.dateId === activeDateId) return;
 
     activeDateId = s.dateId;
     todayMap = {};
     renderBoard();
+    setMessage("", "");
 
     if (typeof unsub === "function") unsub();
 
@@ -301,7 +305,7 @@
   }
 
   function syncUI(){
-    const s = dubaiParts();
+    const s = dubaiNow();
     clockEl.textContent = s.time;
     dateEl.textContent = s.prettyDate;
 
@@ -324,16 +328,15 @@
     const hasIn = !!rec.checkInTime;
     const hasOut = !!rec.checkOutTime;
 
-    const inOpen = s.minutes <= CHECKIN_CUTOFF_MIN;
-    const outOpen = s.minutes <= CHECKOUT_CUTOFF_MIN;
+    const checkInOpen  = inWindow(CHECKIN_OPEN_MIN, CHECKIN_CLOSE_MIN, s.minutes);
+    const checkOutOpen = inWindow(CHECKOUT_OPEN_MIN, CHECKOUT_CLOSE_MIN, s.minutes);
 
-    // Your rules:
-    inBtn.disabled  = !(inOpen && !hasIn && !hasOut);
-    outBtn.disabled = !(outOpen && hasIn && !hasOut);
+    inBtn.disabled  = !(checkInOpen && !hasIn && !hasOut);
+    outBtn.disabled = !(checkOutOpen && hasIn && !hasOut);
   }
 
   async function log(type){
-    const s = dubaiParts();
+    const s = dubaiNow();
     const code = sanitizeCode(input.value);
     const name = TEAM[code];
     if (!name) return setMessage("Invalid code.", "warn");
@@ -342,18 +345,17 @@
     const hasIn = !!rec.checkInTime;
     const hasOut = !!rec.checkOutTime;
 
-    const inOpen = s.minutes <= CHECKIN_CUTOFF_MIN;
-    const outOpen = s.minutes <= CHECKOUT_CUTOFF_MIN;
+    const checkInOpen  = inWindow(CHECKIN_OPEN_MIN, CHECKIN_CLOSE_MIN, s.minutes);
+    const checkOutOpen = inWindow(CHECKOUT_OPEN_MIN, CHECKOUT_CLOSE_MIN, s.minutes);
 
     if (type === "IN"){
-      if (!inOpen) return setMessage("Check-in closed after 10:05 AM.", "warn");
-      if (hasIn) return setMessage("You already checked in today.", "warn");
-      if (hasOut) return setMessage("Already checked out. Check-in not allowed.", "warn");
-    }
-    if (type === "OUT"){
-      if (!outOpen) return setMessage("Check-out closed after 4:10 PM.", "warn");
+      if (!checkInOpen) return setMessage("Check-in is closed right now.", "warn");
+      if (hasIn) return setMessage("Already checked in today.", "warn");
+      if (hasOut) return setMessage("Already checked out today. Check-in not allowed.", "warn");
+    } else {
+      if (!checkOutOpen) return setMessage("Check-out is closed right now.", "warn");
       if (!hasIn) return setMessage("You must check in first.", "warn");
-      if (hasOut) return setMessage("You already checked out today.", "warn");
+      if (hasOut) return setMessage("Already checked out today.", "warn");
     }
 
     try{
